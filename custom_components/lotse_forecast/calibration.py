@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,6 +31,19 @@ class CalibrationModel:
         self._ape_sum = 0.0
         self.last_se_snapshot: float | None = None
 
+    def _cloud_bucket(self, cloud_cover: float) -> int:
+        """Map cloud cover percentage (0-100) to bucket index.
+        
+        Args:
+            cloud_cover: Cloud cover in percentage (0-100).
+            
+        Returns:
+            Bucket index (0 to cloud_buckets-1).
+        """
+        clamped = max(0, min(100, cloud_cover))
+        bucket = int(clamped * self.cloud_buckets / 100)
+        return min(bucket, self.cloud_buckets - 1)
+
     def update(
         self,
         actual_wh: float,
@@ -41,6 +55,11 @@ class CalibrationModel:
         Skips night-time or zero-raw samples. Updates the global scale
         EMA, then updates the cloud-cover bucket factor as a residual
         from the global scale (so they don't compound).
+        
+        Args:
+            actual_wh: Actual measured energy (Wh).
+            raw_wh: Raw forecast energy (Wh).
+            cloud_cover: Optional cloud cover (0-100%).
         """
         if raw_wh <= 0:
             return
@@ -68,6 +87,13 @@ class CalibrationModel:
         Applies global_scale * cloud_factor (if cloud data available).
         Cloud factors model residual from global scale, so the product
         represents the total correction.
+        
+        Args:
+            raw_wh: Raw forecast energy (Wh).
+            cloud_cover: Optional cloud cover (0-100%).
+            
+        Returns:
+            Calibrated energy >= 0.
         """
         adjusted = raw_wh * self.global_scale
         if cloud_cover is not None:
@@ -78,127 +104,165 @@ class CalibrationModel:
     def store_forecast(self, calibrated: dict[str, float],
                        raw: dict[str, float] | None = None,
                        now: datetime | None = None) -> None:
-        """Cache today's forecast (calibrated + raw) for past-hour merge + training."""
+        """Cache today's forecast (calibrated + raw) for past-hour merge + training.
+        
+        Args:
+            calibrated: ISO timestamp → calibrated energy (Wh).
+            raw: Optional ISO timestamp → raw energy (Wh).
+            now: Reference time (default: UTC now).
+        """
         if now is None:
             now = datetime.now(timezone.utc)
         today = now.date()
         self.today_predicted = {
             ts: wh for ts, wh in calibrated.items()
-            if (dt := _parse_dt(ts)) is not None and dt.date() == today
+            if datetime.fromisoformat(ts).date() == today
         }
-        if raw is not None:
+        if raw:
             self._raw_predicted = {
                 ts: wh for ts, wh in raw.items()
-                if (dt := _parse_dt(ts)) is not None and dt.date() == today
+                if datetime.fromisoformat(ts).date() == today
             }
 
-    def train_from_actual(self, hour_iso: str, actual_wh: float,
-                          cloud_cover: float | None = None) -> None:
-        """Train the model using actual production for a completed hour.
-
-        Looks up the raw forecast for that hour from the cache.
-        Silently skips if the raw forecast isn't available.
-        """
-        raw_wh = self._raw_predicted.get(hour_iso)
-        if raw_wh is not None and raw_wh > 0:
-            self.update(actual_wh, raw_wh, cloud_cover)
-
     def reset(self) -> None:
-        """Return model to initial (identity) state."""
+        """Reset model to initial state (identity scaling, no training)."""
         self.global_scale = 1.0
         self.cloud_factors = [1.0] * self.cloud_buckets
         self.sample_count = 0
         self.mape = None
+        self._ape_sum = 0.0
         self.today_predicted = {}
         self._raw_predicted = {}
-        self._ape_sum = 0.0
-        self.last_se_snapshot = None
+        _LOGGER.info("Calibration model reset to defaults")
 
     def to_dict(self) -> dict:
+        """Serialize model state for persistence.
+        
+        Returns:
+            Dict with global_scale, cloud_factors, sample_count, mape, alpha.
+        """
         return {
             "global_scale": self.global_scale,
             "cloud_factors": list(self.cloud_factors),
             "sample_count": self.sample_count,
             "mape": self.mape,
             "alpha": self.alpha,
-            "cloud_buckets": self.cloud_buckets,
-            "today_predicted": dict(self.today_predicted),
-            "_raw_predicted": dict(self._raw_predicted),
-            "_ape_sum": self._ape_sum,
-            "last_se_snapshot": self.last_se_snapshot,
+            "today_predicted": self.today_predicted,
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> CalibrationModel:
-        alpha = data.get("alpha", 0.2)
-        cloud_buckets = data.get("cloud_buckets", 5)
+    def from_dict(cls, data: dict, **kwargs) -> CalibrationModel:
+        """Reconstruct model from serialized state.
+        
+        Args:
+            data: Dict from to_dict().
+            **kwargs: Override alpha or cloud_buckets.
+            
+        Returns:
+            Restored CalibrationModel.
+            
+        Raises:
+            ValueError: If cloud_factors length doesn't match cloud_buckets.
+        """
+        alpha = data.get("alpha", kwargs.get("alpha", 0.2))
+        cloud_buckets = kwargs.get("cloud_buckets", 5)
+        
         model = cls(alpha=alpha, cloud_buckets=cloud_buckets)
-        model.global_scale = data.get("global_scale", 1.0)
-        raw_factors = data.get("cloud_factors", [1.0] * cloud_buckets)
-        model.cloud_factors = (
-            list(raw_factors) + [1.0] * max(0, cloud_buckets - len(raw_factors))
-        )[:cloud_buckets]
-        model.sample_count = data.get("sample_count", 0)
+        
+        # Validate and restore cloud_factors
+        cf = data.get("cloud_factors", [1.0] * cloud_buckets)
+        if len(cf) != cloud_buckets:
+            _LOGGER.warning(
+                "Cloud factors length %d doesn't match buckets %d; using defaults",
+                len(cf), cloud_buckets
+            )
+            cf = [1.0] * cloud_buckets
+        model.cloud_factors = list(cf)
+        
+        model.global_scale = float(data.get("global_scale", 1.0))
+        model.sample_count = int(data.get("sample_count", 0))
         model.mape = data.get("mape")
-        model.today_predicted = data.get("today_predicted", {})
-        model._raw_predicted = data.get("_raw_predicted", {})
-        model._ape_sum = data.get("_ape_sum", 0.0)
-        model.last_se_snapshot = data.get("last_se_snapshot")
+        model.today_predicted = dict(data.get("today_predicted", {}))
+        
         return model
 
-    def _cloud_bucket(self, cloud_cover: float) -> int:
-        if cloud_cover < 0:
-            return 0
-        if cloud_cover >= 100:
-            return self.cloud_buckets - 1
-        width = 100.0 / self.cloud_buckets
-        return int(cloud_cover / width)
 
-
-def merge_past_hours(
-    predicted_cache: dict[str, float],
-    raw_wh_hours: dict[str, float],
-    now: datetime | None = None,
-) -> dict[str, float]:
-    """Merge cached past predictions with fresh future predictions.
-
-    Past hours (strictly before *now*) use the cached predicted value
-    when available. Current and future hours always use raw_wh_hours.
-    This restores the 'full-day curve' that was present in forecast.solar.
+def merge_past_hours(cache: dict[str, float], raw: dict[str, float],
+                    now: datetime | None = None) -> dict[str, float]:
+    """Merge cached past-hour values with raw forecast.
+    
+    For hours that have passed today, use cached (actual) values.
+    For current and future hours, use raw forecast.
+    Ignore cache from previous days.
+    
+    Args:
+        cache: Past hours' actual/calibrated forecast (ISO → Wh).
+        raw: Raw forecast (ISO → Wh).
+        now: Reference time (default: UTC now).
+        
+    Returns:
+        Merged forecast (ISO → Wh).
     """
     if now is None:
         now = datetime.now(timezone.utc)
-    result = {}
-    for ts, raw_wh in raw_wh_hours.items():
-        dt = _parse_dt(ts)
-        if dt is not None and dt < now and ts in predicted_cache:
-            result[ts] = predicted_cache[ts]
+    
+    if not raw:
+        return {}
+    
+    today = now.date()
+    merged = {}
+    
+    for ts, wh in raw.items():
+        try:
+            dt = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            # Can't parse timestamp; use raw
+            merged[ts] = wh
+            continue
+        
+        # If hour is in the past (before now) and same day, prefer cache
+        if dt.date() == today and dt < now:
+            if ts in cache:
+                merged[ts] = cache[ts]
+            else:
+                merged[ts] = wh
         else:
-            result[ts] = raw_wh
-    return result
+            # Current or future hour: use raw
+            merged[ts] = wh
+    
+    return merged
 
 
-def compute_mape(actuals: list[float], predictions: list[float]) -> float | None:
-    """Mean Absolute Percentage Error.
-
-    Returns None for empty input. Raises ValueError on length mismatch.
-    Uses max(0.001, actual) as denominator to avoid division by zero.
+def compute_mape(actuals: list[float], forecasts: list[float]) -> float | None:
+    """Compute Mean Absolute Percentage Error.
+    
+    Args:
+        actuals: Actual measured values.
+        forecasts: Forecast values.
+        
+    Returns:
+        MAPE as percentage, or None if empty.
+        
+    Raises:
+        ValueError: If lists have different lengths.
     """
-    if not actuals and not predictions:
+    if not actuals:
         return None
-    if len(actuals) != len(predictions):
+    
+    if len(actuals) != len(forecasts):
         raise ValueError(
-            f"Length mismatch: {len(actuals)} actuals vs {len(predictions)} predictions"
+            f"Mismatched lengths: {len(actuals)} actuals vs {len(forecasts)} forecasts"
         )
-    total_pct = 0.0
-    for a, p in zip(actuals, predictions):
-        denom = max(0.001, abs(a))
-        total_pct += abs(p - a) / denom * 100
-    return total_pct / len(actuals)
-
-
-def _parse_dt(ts: str) -> datetime | None:
-    try:
-        return datetime.fromisoformat(ts)
-    except (ValueError, TypeError):
-        return None
+    
+    errors = []
+    for actual, forecast in zip(actuals, forecasts):
+        if actual == 0:
+            # Avoid division by zero; use small epsilon
+            denom = max(0.001, abs(forecast))
+        else:
+            denom = abs(actual)
+        
+        error = abs(actual - forecast) / denom * 100
+        errors.append(error)
+    
+    return sum(errors) / len(errors) if errors else None
